@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -122,6 +123,15 @@ private:
   };
 
   void OnICacheInvalidate(u32 address, u32 length);
+  // Busy-wait loops exactly as Dolphin's JITs detect them
+  // (PPCAnalyzer::IsBusyWaitLoop). A native dispatch that starts and ends at
+  // such a loop's head idles to the next CoreTiming event, as the JIT does
+  // when it reaches the loop's back-branch. Cached per runtime address and
+  // dropped when that code is invalidated.
+  bool IsIdleLoopAt(u32 address);
+  // Ordered, so an invalidation erases its range with one lookup instead of
+  // walking every entry (games flush vertex data thousands of times a frame).
+  std::map<u32, bool> m_idle_loop_cache;
   int ChunkIndexOf(u32 address);
   bool IsForcedFallbackAddress(u32 address) const;
   bool ChunkContainsHostCall(u32 index) const;
@@ -198,6 +208,7 @@ private:
   std::vector<ActiveRelSection> m_active_rel_sections;
   std::vector<u64> m_rel_list_signature;  // last seen module list (see RefreshRelSections*)
   std::vector<u64> m_rel_list_scratch;
+  std::vector<u32> m_rel_list_headers;  // reused each slice to avoid allocating
   std::unordered_set<u32> m_rel_unmatched_logged;  // header addresses already reported
   std::vector<int> m_chunk_rel_sections;
   std::vector<u64> m_effective_chunk_hashes;

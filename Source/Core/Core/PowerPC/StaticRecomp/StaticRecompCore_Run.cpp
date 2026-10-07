@@ -182,8 +182,12 @@ void StaticRecompCore::Run()
           m_guest.timebase += total_cycles / SystemTimers::TIMER_RATIO;
           m_timebase_cycle_remainder = total_cycles % SystemTimers::TIMER_RATIO;
 
-          // Idle loop skipping for configured target loops (e.g. Wii Menu OSIdleThread)
-          if (m_guest.pc == m_idle_pc && m_idle_pc != 0)
+          // Idle loop skipping: configured target loops (e.g. Wii Menu
+          // OSIdleThread), and any busy-wait loop Dolphin's analyzer
+          // recognizes. A native loop returns to its own head only when it
+          // ran out of cycle budget, i.e. it is still waiting.
+          if ((m_guest.pc == m_idle_pc && m_idle_pc != 0) ||
+              (m_guest.pc == runtime_dispatch_address && IsIdleLoopAt(m_guest.pc)))
           {
             m_system.GetCoreTiming().Idle();
           }

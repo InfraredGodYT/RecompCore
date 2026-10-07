@@ -445,14 +445,20 @@ void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
         }
       }
 
-      // One call per line, exactly as the unbatched loop would make.
-      for (u32 i = 0; i <= extra; ++i)
+      if (xo == 982u)
       {
-        const u32 line = ea + i * 32u;
-        if (xo == 982u)
-          ppc.iCache.Invalidate(system.GetMemory(), system.GetJitInterface(), line);
-        else
-          system.GetJitInterface().InvalidateICacheLine(line);
+        // icbi goes through the emulated icache, one line at a time.
+        for (u32 i = 0; i <= extra; ++i)
+          ppc.iCache.Invalidate(system.GetMemory(), system.GetJitInterface(), ea + i * 32u);
+      }
+      else
+      {
+        // One range invalidation for the whole batch, as Jit64::dcbx does
+        // (InvalidateICacheLinesFromJIT). It marks exactly the union of the
+        // per-line invalidations, but StaticRecomp's block cache has no
+        // valid-block filter, so per-line calls for flushed vertex data cost
+        // a full chunk search each.
+        system.GetJitInterface().InvalidateICacheLines(ea, extra + 1u);
       }
       cpu->pc = cia + 4u;
       return;

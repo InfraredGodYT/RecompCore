@@ -8,6 +8,7 @@
 #include "Common/Logging/Log.h"
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 
 namespace
 {
@@ -72,10 +73,9 @@ void StaticRecompCore::RefreshRelSectionsIfModuleListChanged()
   // The table is included because OSLink enqueues a module before it finishes
   // rewriting the section offsets (BSS gets its address last); the mapping
   // must follow those writes too.
-  std::vector<u32> headers;
-  ReadOSModuleList(&headers);
+  ReadOSModuleList(&m_rel_list_headers);
   m_rel_list_scratch.clear();
-  for (const u32 header_address : headers)
+  for (const u32 header_address : m_rel_list_headers)
   {
     const u8* header = m_guest.ram + (header_address - 0x80000000u);
     const u32 id = ReadGuestBE32(header);
@@ -86,11 +86,14 @@ void StaticRecompCore::RefreshRelSectionsIfModuleListChanged()
     if (num_sections <= 4096 &&
         GuestRangeInRam(info_address, num_sections * 8, m_guest.ram_size))
     {
+      // Word-at-a-time mix: this runs every slice, and any change to an
+      // entry must change the signature, nothing more.
       const u8* table = m_guest.ram + (info_address - 0x80000000u);
-      for (u32 i = 0; i < num_sections * 8; ++i)
+      for (u32 i = 0; i < num_sections * 2; ++i)
       {
-        table_hash ^= table[i];
-        table_hash *= 0x100000001B3ull;
+        u32 word;
+        std::memcpy(&word, table + i * 4, sizeof(word));
+        table_hash = (table_hash ^ word) * 0x100000001B3ull;
       }
     }
     m_rel_list_scratch.push_back((static_cast<u64>(header_address) << 32) | id);
@@ -231,6 +234,21 @@ void StaticRecompCore::RefreshRelSections()
 bool StaticRecompCore::ResolveNativeAddress(u32 runtime_address, u32* linked_address,
                                             u32* rel_section_index)
 {
+  // Fast path for DOL code, the common case: a RAM address whose lookup
+  // entry is a non-REL chunk. REL code is mapped from heap memory, which
+  // never overlaps the DOL's text, so such a hit cannot be REL code.
+  if (runtime_address >= 0x80000000u && runtime_address - 0x80000000u < m_lookup_ram_size)
+  {
+    const int chunk = m_chunk_lookup_table[(runtime_address - 0x80000000u) >> 2];
+    if (chunk >= 0 && m_chunk_rel_sections[chunk] < 0)
+    {
+      *linked_address = runtime_address;
+      if (rel_section_index)
+        *rel_section_index = 0xffffffffu;
+      return true;
+    }
+  }
+
   const auto resolve_active = [&]() {
     for (u32 i = 0; i < m_active_rel_sections.size(); ++i)
     {
@@ -268,6 +286,13 @@ bool StaticRecompCore::ResolveNativeAddress(u32 runtime_address, u32* linked_add
 
 bool StaticRecompCore::ResolveRuntimeAddress(u32 linked_address, u32* runtime_address) const
 {
+  // Only addresses inside the virtual REL window can be linked REL code.
+  if (m_rel_window_size != 0 &&
+      (linked_address < m_rel_window_start || linked_address - m_rel_window_start >= m_rel_window_size))
+  {
+    *runtime_address = linked_address;
+    return true;
+  }
   for (const ActiveRelSection& section : m_active_rel_sections)
   {
     if (linked_address >= section.linked_start &&
@@ -496,11 +521,85 @@ void StaticRecompCore::VerifyChunk(u32 index)
   }
 }
 
+bool StaticRecompCore::IsIdleLoopAt(u32 address)
+{
+  const auto cached = m_idle_loop_cache.find(address);
+  if (cached != m_idle_loop_cache.end())
+    return cached->second;
+
+  // Dolphin's own analysis, so a loop idles here exactly when Jit64 would
+  // idle it (OpType::Integer/Load only, no stores, branches only to itself,
+  // no CTR use, no reading a register before the loop overwrites it).
+  PPCAnalyst::BlockStats stats{};
+  PPCAnalyst::BlockRegStats gpa{};
+  PPCAnalyst::BlockRegStats fpa{};
+  PPCAnalyst::CodeBlock block;
+  block.m_stats = &stats;
+  block.m_gpa = &gpa;
+  block.m_fpa = &fpa;
+  constexpr std::size_t MAX_LOOP_INSTRUCTIONS = 32;
+  if (m_code_buffer.size() < MAX_LOOP_INSTRUCTIONS)
+    m_code_buffer.resize(MAX_LOOP_INSTRUCTIONS);
+  analyzer.Analyze(address, &block, &m_code_buffer, MAX_LOOP_INSTRUCTIONS);
+
+  bool idle = false;
+  for (u32 i = 0; i < block.m_num_instructions; ++i)
+  {
+    if (m_code_buffer[i].branchIsIdleLoop && m_code_buffer[i].branchTo == address)
+    {
+      idle = true;
+      break;
+    }
+  }
+  m_idle_loop_cache.emplace(address, idle);
+  return idle;
+}
+
 void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
 {
-  if (m_fallback_jit)
+  // Forward to the fallback JIT only if the range holds code it compiled,
+  // tested with its valid-block bitset one 32-byte line at a time -- exactly
+  // the filter Jit64's dcbx loop applies before it invalidates. Without it,
+  // every flushed range of plain data (video frames, vertex buffers) makes
+  // the block cache erase three hash sets for every 4 bytes of the range.
+  if (m_fallback_jit && length != 0)
   {
-    m_fallback_jit->GetBlockCache()->InvalidateICache(address, length, false);
+    JitBaseBlockCache* const fallback_cache = m_fallback_jit->GetBlockCache();
+    const u32* const valid_bits = fallback_cache->GetBlockBitSet();
+    auto& mmu = m_system.GetMMU();
+    bool has_code = false;
+    u32 line = address & ~0x1fu;
+    const u64 end = static_cast<u64>(address) + length;
+    u32 page = 0xFFFFFFFFu;
+    u32 page_physical = 0;
+    bool page_valid = false;
+    for (; static_cast<u64>(line) < end && !has_code; line += 32)
+    {
+      if ((line & ~0xFFFu) != page)
+      {
+        page = line & ~0xFFFu;
+        const auto translated = mmu.JitCache_TranslateAddress(page);
+        page_valid = translated.valid;
+        page_physical = translated.address;
+      }
+      if (!page_valid)
+        continue;
+      const u32 bit = (page_physical + (line - page)) >> 5;
+      has_code = (valid_bits[bit >> 5] & (1u << (bit & 31u))) != 0;
+      if (line > 0xFFFFFFE0u)
+        break;
+    }
+    if (has_code)
+      fallback_cache->InvalidateICache(address, length, false);
+  }
+
+  // Code that changed may no longer be (or may now be) a busy-wait loop.
+  if (!m_idle_loop_cache.empty() && length != 0)
+  {
+    const u64 end = static_cast<u64>(address) + length;
+    auto it = m_idle_loop_cache.lower_bound(address);
+    while (it != m_idle_loop_cache.end() && it->first < end)
+      it = m_idle_loop_cache.erase(it);
   }
 
   if (!m_module_active || length == 0)
