@@ -4,6 +4,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
+/* See cpu_interpreter_private.h: inline IEEE classification instead of
+ * libmingwex calls; identical results under -fno-fast-math. */
+#if defined(__GNUC__) || defined(__clang__)
+#undef isnan
+#define isnan(x) __builtin_isnan(x)
+#undef isinf
+#define isinf(x) __builtin_isinf(x)
+#endif
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
@@ -191,10 +200,34 @@ static u32 psq_type_size(u8 type) {
  *  - Quantization: round the lane to f32 first, multiply by the f32
  *    power-of-two scale, clamp in f32, truncate. NaN quantizes to 0
  *    (matching SType(NaN-after-clamp) in release Dolphin on arm64). */
+/* 2^n for every GQR scale n in [-32, 31], indexed by the raw 6-bit field
+ * (scale & 63). Every entry is an exact power of two in f32 and f64, so
+ * multiplying by it gives exactly what ldexp/ldexpf did, without a libm call
+ * per quantized value (ldexpf alone was ~30% of the intro's CPU time). */
+static const f64 k_psq_pow2[64] = {
+    0x1p0,   0x1p1,   0x1p2,   0x1p3,   0x1p4,   0x1p5,   0x1p6,   0x1p7,
+    0x1p8,   0x1p9,   0x1p10,  0x1p11,  0x1p12,  0x1p13,  0x1p14,  0x1p15,
+    0x1p16,  0x1p17,  0x1p18,  0x1p19,  0x1p20,  0x1p21,  0x1p22,  0x1p23,
+    0x1p24,  0x1p25,  0x1p26,  0x1p27,  0x1p28,  0x1p29,  0x1p30,  0x1p31,
+    0x1p-32, 0x1p-31, 0x1p-30, 0x1p-29, 0x1p-28, 0x1p-27, 0x1p-26, 0x1p-25,
+    0x1p-24, 0x1p-23, 0x1p-22, 0x1p-21, 0x1p-20, 0x1p-19, 0x1p-18, 0x1p-17,
+    0x1p-16, 0x1p-15, 0x1p-14, 0x1p-13, 0x1p-12, 0x1p-11, 0x1p-10, 0x1p-9,
+    0x1p-8,  0x1p-7,  0x1p-6,  0x1p-5,  0x1p-4,  0x1p-3,  0x1p-2,  0x1p-1,
+};
+
+static inline f64 psq_pow2(s32 n) {
+    return k_psq_pow2[(u32)n & 63u];
+}
+
 static f64 psq_dequant(f64 value, s32 scale) {
     if (scale == 0)
         return (f64)(f32)value;
-    return (f64)(f32)ldexp(value, -scale);
+    /* value is an integer of at most 16 bits, so value * 2^-scale is exact in
+     * f64, as ldexp(value, -scale) was; the single rounding is to f32. -scale
+     * stays in [-31, 32]; 2^32 is not in the table, so handle it directly. */
+    if (scale == -32)
+        return (f64)(f32)(value * 0x1p32);
+    return (f64)(f32)(value * psq_pow2(-scale));
 }
 
 static f64 psq_load_value(CPUState* cpu, u32 ea, u8 type, s32 scale) {
@@ -215,7 +248,9 @@ static f64 psq_load_value(CPUState* cpu, u32 ea, u8 type, s32 scale) {
 }
 
 static s64 psq_quantize_int(f64 value, s64 min_value, s64 max_value, s32 scale) {
-    f32 conv = (f32)value * ldexpf(1.0f, scale);
+    /* (f32)psq_pow2(scale) is exactly ldexpf(1.0f, scale): scale is in
+     * [-32, 31] and every such power of two is a normal f32. */
+    f32 conv = (f32)value * (f32)psq_pow2(scale);
     if (isnan(conv))
         return 0;
     if (conv <= (f32)min_value)

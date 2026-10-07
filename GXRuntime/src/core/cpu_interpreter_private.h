@@ -4,6 +4,17 @@
 #include "core/cpu.h"
 #include <math.h>
 
+/* MinGW's <math.h> implements isnan/isinf as calls into libmingwex
+ * (__isnan, __fpclassify), which dominated profiles of FP-heavy guest code.
+ * GCC/Clang's builtins are the same IEEE classification, inlined. Results are
+ * identical: the module is built with -fno-fast-math (no -ffinite-math-only). */
+#if defined(__GNUC__) || defined(__clang__)
+#undef isnan
+#define isnan(x) __builtin_isnan(x)
+#undef isinf
+#define isinf(x) __builtin_isinf(x)
+#endif
+
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
