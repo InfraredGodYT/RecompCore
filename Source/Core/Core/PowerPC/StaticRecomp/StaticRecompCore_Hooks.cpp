@@ -393,13 +393,67 @@ void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
       const u32 ra = (raw >> 16) & 31u;
       const u32 rb = (raw >> 11) & 31u;
       const u32 ea = (ra ? cpu->gpr[ra] : 0u) + cpu->gpr[rb];
-      if (xo == 982u)
-        ppc.iCache.Invalidate(system.GetMemory(), system.GetJitInterface(), ea);
-      else
-        system.GetJitInterface().InvalidateICacheLine(ea);
       // These bypass SingleStepInner, so charge Dolphin's PPCTables cost
       // here (icbi 4, dcbf/dcbst/dcbi 5); their emitted block cost is zero.
-      ppc.downcount -= (xo == 982u) ? 4 : 5;
+      const int op_cycles = (xo == 982u) ? 4 : 5;
+      ppc.downcount -= op_cycles;
+
+      // Loop batching, mirroring Jit64::dcbx. Cache maintenance is almost
+      // always the loop
+      //   dcbX 0, rB / addi rB, rB, 32 / bdnz -8
+      // and without this every 32-byte line exits native code and re-enters
+      // through the dispatcher. Run the extra iterations here instead: as many
+      // as fit in the remaining downcount (so CoreTiming events land where they
+      // would have), never more than CTR asks for, charging the same cycles per
+      // iteration (op + addi 1 + bdnz 1). CTR and rB are advanced by the extra
+      // count only; the native addi/bdnz then run once more as normal.
+      u32 extra = 0;
+      if (ra == 0 && rb != 0)
+      {
+        const u32 next_pc = cia + 4u;
+        if (next_pc >= 0x80000000u && next_pc - 0x80000000u + 8u <= cpu->ram_size)
+        {
+          const u8* code = cpu->ram + (next_pc - 0x80000000u);
+          const u32 next = static_cast<u32>(code[0]) << 24 | static_cast<u32>(code[1]) << 16 |
+                           static_cast<u32>(code[2]) << 8 | code[3];
+          const u32 next2 = static_cast<u32>(code[4]) << 24 | static_cast<u32>(code[5]) << 16 |
+                            static_cast<u32>(code[6]) << 8 | code[7];
+          const u32 addi_rb_rb_32 = 0x38000020u | (rb << 21) | (rb << 16);
+          if (next == addi_rb_rb_32 && next2 == 0x4200FFF8u)
+          {
+            // cpu->downcount holds this dispatch's not-yet-flushed (negative)
+            // block charges, so the live budget is the sum of both.
+            const s64 remaining = static_cast<s64>(ppc.downcount) + cpu->downcount;
+            if (remaining > 0)
+            {
+              const u32 cycles_per_loop = static_cast<u32>(op_cycles) + 2u;
+              const u64 fit = static_cast<u64>(remaining) / cycles_per_loop;
+              // CTR - 1 wraps for CTR == 0 (a 2^32-iteration loop), as in Jit64.
+              const u32 ctr_left = cpu->ctr - 1u;
+              extra = static_cast<u32>(fit < ctr_left ? fit : ctr_left);
+            }
+            if (extra != 0)
+            {
+              cpu->ctr -= extra;
+              cpu->gpr[rb] += extra * 32u;
+              const u64 extra_cycles = static_cast<u64>(extra) * (static_cast<u32>(op_cycles) + 2u);
+              ppc.downcount -= static_cast<int>(extra_cycles);
+              core->AdvanceGuestTimebase(extra_cycles);
+              core->m_hook_fallback_instructions += extra;
+            }
+          }
+        }
+      }
+
+      // One call per line, exactly as the unbatched loop would make.
+      for (u32 i = 0; i <= extra; ++i)
+      {
+        const u32 line = ea + i * 32u;
+        if (xo == 982u)
+          ppc.iCache.Invalidate(system.GetMemory(), system.GetJitInterface(), line);
+        else
+          system.GetJitInterface().InvalidateICacheLine(line);
+      }
       cpu->pc = cia + 4u;
       return;
     }
