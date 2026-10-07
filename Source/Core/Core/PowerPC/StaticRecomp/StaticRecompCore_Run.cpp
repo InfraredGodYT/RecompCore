@@ -120,6 +120,7 @@ void StaticRecompCore::Run()
   while (*state_ptr == CPU::State::Running)
   {
     core_timing.Advance();
+    RefreshRelSectionsIfModuleListChanged();
     const std::string current_game_id = SConfig::GetInstance().GetGameID();
     m_module_active = m_module && (current_game_id.empty() || current_game_id == m_module->game_id);
 
@@ -194,6 +195,10 @@ void StaticRecompCore::Run()
           {
             // DolRecomp's runtime already redirected pc/msr/srr to the guest
             // exception vector; the flag only signals that it happened.
+            // REL code raises it with its linked (virtual) address; the guest
+            // handler resumes at SRR0 with rfi, so it must be the runtime one.
+            if (m_has_rel_modules)
+              m_guest.srr0 = TranslateRelAddress(m_guest.srr0);
             m_guest.exception = 0;
             m_guest.program_exception = 0;
             ++m_native_exceptions;

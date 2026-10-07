@@ -104,6 +104,10 @@ static const StaticRecompModuleDesc s_desc = {
     s_chunk_ranges,
     MODULE_CHUNK_RANGE_COUNT,
     s_chunk_hashes,
+    MODULE_REL_MODULES,
+    MODULE_REL_MODULE_COUNT,
+    MODULE_REL_SLOT_BASES,
+    MODULE_REL_SLOT_COUNT,
 };
 
 #if defined(_WIN32)

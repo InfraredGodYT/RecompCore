@@ -130,6 +130,11 @@ private:
   bool ResolveRuntimeAddress(u32 linked_address, u32* runtime_address) const;
   u32 TranslateRelAddress(u32 linked_address);
   void RefreshRelSections();
+  // REL mapping follows the guest OS's own module list (__OSModuleList), so a
+  // module is mapped exactly while the game has it linked. Called once per
+  // CoreTiming slice; re-maps only when the list's signature changes.
+  void ReadOSModuleList(std::vector<u32>* headers) const;
+  void RefreshRelSectionsIfModuleListChanged();
 
   static void SetPPCStateFromGuestState(const CPUState& s, PowerPC::PowerPCState& ppc);
 
@@ -191,6 +196,9 @@ private:
     u32 size;
   };
   std::vector<ActiveRelSection> m_active_rel_sections;
+  std::vector<u64> m_rel_list_signature;  // last seen module list (see RefreshRelSections*)
+  std::vector<u64> m_rel_list_scratch;
+  std::unordered_set<u32> m_rel_unmatched_logged;  // header addresses already reported
   std::vector<int> m_chunk_rel_sections;
   std::vector<u64> m_effective_chunk_hashes;
   u64 m_rel_mapping_generation = 0;
@@ -202,6 +210,11 @@ private:
   std::vector<int> m_chunk_lookup_table;
   u32 m_lookup_ram_size = 0;
   u32 m_lookup_exram_size = 0;
+  // Linked (virtual) addresses of position-independent REL code live outside
+  // guest RAM (DolRecomp --rels uses 0x90000000+ on GameCube); this window
+  // gives them lookup-table entries after RAM and EXRAM.
+  u32 m_rel_window_start = 0;
+  u32 m_rel_window_size = 0;
   int GetAddressLookupIndex(u32 address) const;
   void InitLookupTable(u32 ram_size, u32 exram_size);
 

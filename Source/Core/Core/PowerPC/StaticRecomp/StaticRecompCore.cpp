@@ -84,14 +84,15 @@ bool RelModulesValid(const StaticRecompModuleDesc& desc)
 {
   if (desc.num_rel_modules == 0)
     return desc.rel_modules == nullptr;
-  if (!desc.rel_modules)
+  if (!desc.rel_modules || !desc.rel_slot_bases || desc.num_rel_slots == 0)
     return false;
   for (u32 i = 0; i < desc.num_rel_modules; ++i)
   {
     const StaticRecompRelModule& module = desc.rel_modules[i];
     if (module.module_id == 0 || module.section_count == 0 ||
         module.section_info_offset < 0x40 || module.file_size < 0x40 ||
-        !module.sections || module.num_sections == 0)
+        !module.sections || module.num_sections == 0 ||
+        static_cast<u64>(module.first_slot) + module.section_count > desc.num_rel_slots)
       return false;
     for (u32 j = 0; j < module.num_sections; ++j)
     {

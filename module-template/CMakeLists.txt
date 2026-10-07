@@ -40,6 +40,11 @@ set(MODULE_NAME "g${GAME_ID}_recomp")
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 set(MODULE_TABLES "${CMAKE_CURRENT_BINARY_DIR}/module_tables.inc")
+# REL metadata exists only when DolRecomp compiled RELs (--rels).
+set(MODULE_TABLES_EXTRA_DEPENDS)
+if(EXISTS "${GENERATED_DIR}/generated_rels.txt")
+  list(APPEND MODULE_TABLES_EXTRA_DEPENDS "${GENERATED_DIR}/generated_rels.txt")
+endif()
 add_custom_command(
   OUTPUT "${MODULE_TABLES}"
   COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/gen_module_tables.py"
@@ -47,7 +52,7 @@ add_custom_command(
           "${GENERATED_DIR}/main.dol" "${MODULE_TABLES}"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gen_module_tables.py"
           "${GENERATED_DIR}/generated.h" "${GENERATED_DIR}/generated_smc.txt"
-          "${GENERATED_DIR}/main.dol"
+          "${GENERATED_DIR}/main.dol" ${MODULE_TABLES_EXTRA_DEPENDS}
   COMMENT "Generating module_tables.inc")
 
 file(READ "${GENERATED_DIR}/generated.h" GENERATED_HEADER_TEXT)

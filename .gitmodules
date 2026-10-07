@@ -136,6 +136,6 @@
 	shallow = true
 [submodule "DolRecomp"]
 	path = DolRecomp
-	url = https://github.com/ExpansionPak/DolRecomp.git
-	branch = main
+	url = https://github.com/InfraredGodYT/DolRecomp.git
+	branch = rel-support
 	shallow = true

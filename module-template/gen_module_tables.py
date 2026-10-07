@@ -48,11 +48,94 @@ def load_dol_text(dol_path: Path):
     return read_range
 
 
+def load_rel_metadata(path: Path):
+    """Parse DolRecomp's generated_rels.txt (written by --rels).
+
+    Returns (slot_count, modules) where each module is a dict with id,
+    version, sections, section_info, file_size, first_slot, name and a list
+    of (index, linked_start, size, exec, bss) sections.
+    """
+    if not path.is_file():
+        return 0, []
+    slots = 0
+    modules = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        kind, _, rest = line.partition(" ")
+        if kind == "slots":
+            slots = int(rest)
+            continue
+        fields = dict(f.split("=", 1) for f in rest.split() if "=" in f)
+        if kind == "module":
+            modules.append({
+                "name": rest.split()[0],
+                "id": int(fields["id"]),
+                "version": int(fields["version"]),
+                "sections": int(fields["sections"]),
+                "section_info": int(fields["section_info"], 16),
+                "file_size": int(fields["file_size"], 16),
+                "first_slot": int(fields["first_slot"]),
+                "section_list": [],
+            })
+        elif kind == "section":
+            modules[-1]["section_list"].append((
+                int(rest.split()[0]),
+                int(fields["addr"], 16),
+                int(fields["size"], 16),
+                fields["exec"] == "1",
+                fields["bss"] == "1",
+            ))
+    return slots, modules
+
+
+def write_rel_tables(f, slots: int, modules) -> None:
+    """REL tables for the chassis (module ABI v4)."""
+    exec_sections = [
+        (m, s) for m in modules for s in m["section_list"] if s[3]
+    ]
+    if not modules:
+        f.write("#define MODULE_REL_MODULES NULL\n")
+        f.write("#define MODULE_REL_MODULE_COUNT 0u\n")
+        f.write("#define MODULE_REL_SLOT_BASES NULL\n")
+        f.write("#define MODULE_REL_SLOT_COUNT 0u\n")
+        return
+    f.write("static const StaticRecompRelSection s_rel_sections[] = {\n")
+    for m, (index, addr, size, _exec, _bss) in exec_sections:
+        f.write(f"    {{{m['id']}u, {index}u, 0x{addr:08X}u, 0x{size:X}u}}, /* {m['name']} */\n")
+    f.write("};\n")
+    f.write("static const StaticRecompRelModule s_rel_modules[] = {\n")
+    cursor = 0
+    for m in modules:
+        count = sum(1 for s in m["section_list"] if s[3])
+        f.write(
+            f"    {{{m['id']}u, {m['version']}u, {m['sections']}u, 0x{m['section_info']:X}u, "
+            f"0x{m['file_size']:X}u, &s_rel_sections[{cursor}], {count}u, "
+            f"{m['first_slot']}u}}, /* {m['name']} */\n"
+        )
+        cursor += count
+    f.write("};\n")
+    # Written by the chassis, read by REL code (extern in generated.h).
+    f.write(f"u32 dolrecomp_rel_base[{slots}];\n")
+    f.write("#define MODULE_REL_MODULES s_rel_modules\n")
+    f.write(f"#define MODULE_REL_MODULE_COUNT {len(modules)}u\n")
+    f.write("#define MODULE_REL_SLOT_BASES dolrecomp_rel_base\n")
+    f.write(f"#define MODULE_REL_SLOT_COUNT {slots}u\n")
+
+
 def main() -> int:
     generated_h = Path(sys.argv[1])
     smc_txt = Path(sys.argv[2])
     dol_path = Path(sys.argv[3])
     out_path = Path(sys.argv[4])
+    rel_slots, rel_modules = load_rel_metadata(generated_h.with_name("generated_rels.txt"))
+    rel_code = [
+        (addr, addr + size)
+        for m in rel_modules
+        for (_i, addr, size, is_exec, _b) in m["section_list"]
+        if is_exec
+    ]
 
     header = generated_h.read_text()
     code_ranges = {
@@ -126,14 +209,23 @@ def main() -> int:
         f.write(f"#define MODULE_CHUNK_RANGE_COUNT {len(chunk_ranges)}u\n")
         # FNV-1a 64 of each chunk's original text, so the chassis can verify
         # that guest RAM still holds the code this module was compiled from.
+        # REL chunks get 0 ("adopt on first verify"): their bytes in RAM carry
+        # relocations for wherever the game loaded the module, so no hash can
+        # be known ahead of time. The chassis only maps a REL once the OS has
+        # linked it and its header and section sizes match.
         read_range = load_dol_text(dol_path)
         f.write("static const u64 s_chunk_hashes[] = {\n")
         for a, b in chunk_ranges:
-            f.write(f"    0x{fnv1a64(read_range(a, b)):016X}u,\n")
+            if any(lo <= a and b <= hi for lo, hi in rel_code):
+                f.write("    0x0000000000000000u, /* REL */\n")
+            else:
+                f.write(f"    0x{fnv1a64(read_range(a, b)):016X}u,\n")
         f.write("};\n")
+        write_rel_tables(f, rel_slots, rel_modules)
     print(
         f"module_tables.inc: {len(code_ranges)} code ranges, "
-        f"{len(smc_ranges)} smc ranges, {len(chunk_ranges)} chunk ranges (hashed)"
+        f"{len(smc_ranges)} smc ranges, {len(chunk_ranges)} chunk ranges (hashed), "
+        f"{len(rel_modules)} REL modules, {rel_slots} REL slots"
     )
     return 0
 

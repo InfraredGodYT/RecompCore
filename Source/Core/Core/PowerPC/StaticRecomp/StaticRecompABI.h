@@ -24,7 +24,7 @@ extern "C" {
 
 #ifndef MODERNGEKKO_MODULE_ABI_H
 
-#define STATICRECOMP_ABI_VERSION 3u
+#define STATICRECOMP_ABI_VERSION 4u
 
 typedef struct StaticRecompRange
 {
@@ -49,6 +49,9 @@ typedef struct StaticRecompRelModule
   u32 file_size;
   const StaticRecompRelSection* sections;
   u32 num_sections;
+  // ABI v4: slot of this module's section 0 in rel_slot_bases; section i
+  // uses slot first_slot + i.
+  u32 first_slot;
 } StaticRecompRelModule;
 
 typedef struct StaticRecompModuleDesc
@@ -88,6 +91,11 @@ typedef struct StaticRecompModuleDesc
   const u64* chunk_hashes;
   const StaticRecompRelModule* rel_modules;
   u32 num_rel_modules;
+  // ABI v4: runtime address of every REL section, written by the chassis
+  // when the game links a module and read by the module's position-
+  // independent REL code (DolRecomp --rels). NULL / 0 without RELs.
+  u32* rel_slot_bases;
+  u32 num_rel_slots;
 } StaticRecompModuleDesc;
 
 // The single symbol a module must export:
