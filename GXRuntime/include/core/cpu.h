@@ -425,13 +425,69 @@ bool ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr, bool indexed, 
  * The win is bigger than skipping a call: at every generated site w, gqr_index,
  * indexed and cia are literals, so inlining lets the compiler fold the LSQE
  * test and the w branch away per site, which it cannot do across a call. */
+/* Quantized types (4 = u8, 5 = u16, 6 = s8, 7 = s16) are inlined as well:
+ * video decoders and skinning code convert every value through them, and the
+ * out-of-line path cost two calls per value. The arithmetic is the out-of-line
+ * version's exactly (see psq_dequant / psq_quantize_int in cpu.c):
+ *  - the GQR scale n is a 6-bit signed field, so n is in [-32, 31];
+ *  - store: (f32)lane * 2^n, built as f32 bits ((127 + n) << 23), a normal
+ *    power of two for every n -- the same value ldexpf(1.0f, n) returns;
+ *    NaN stores 0, then clamp, then truncate;
+ *  - load: (f64)(f32)(int * 2^-n), with 2^-n built as f64 bits; an integer of
+ *    at most 16 bits times an exact power of two is exact in f64, so the only
+ *    rounding is the final one to f32, as with ldexp. */
+static inline s32 ppc_psq_scale_field(u32 field) {
+    s32 n = (s32)(field & 0x3Fu);
+    return (n & 0x20) ? n - 64 : n;
+}
+
+static inline s32 ppc_psq_quantize_lane(f64 value, f32 scale, s32 lo, s32 hi) {
+    f32 conv = (f32)value * scale;
+    if (conv != conv) /* NaN */
+        return 0;
+    if (conv <= (f32)lo)
+        return lo;
+    if (conv >= (f32)hi)
+        return hi;
+    return (s32)conv;
+}
+
 static inline bool ppc_psq_load_inline(CPUState* cpu, u8 frD, u32 ea, bool w,
                                        u8 gqr_index, bool indexed, u32 cia) {
     const u32 gqr = cpu->gqr[gqr_index & 7u];
-    if (((gqr >> 16) & 7u) == 0u && (indexed || (cpu->hid2 & PPC_HID2_LSQE) != 0u)) {
-        cpu->fpr[frD] = f64_value(convert_to_double(mem_read32(cpu, ea)));
-        cpu->ps1[frD] = w ? 1.0 : f64_value(convert_to_double(mem_read32(cpu, ea + 4u)));
-        return true;
+    const u32 type = (gqr >> 16) & 7u;
+    if (indexed || (cpu->hid2 & PPC_HID2_LSQE) != 0u) {
+        if (type == 0u) {
+            cpu->fpr[frD] = f64_value(convert_to_double(mem_read32(cpu, ea)));
+            cpu->ps1[frD] = w ? 1.0 : f64_value(convert_to_double(mem_read32(cpu, ea + 4u)));
+            return true;
+        }
+        if (type >= 4u) {
+            const s32 n = ppc_psq_scale_field(gqr >> 24);
+            const f64 mul = f64_value((u64)(1023 - n) << 52); /* 2^-n */
+            f64 v0, v1 = 0.0;
+            switch (type) {
+            case 4u:
+                v0 = (f64)mem_read8(cpu, ea);
+                if (!w) v1 = (f64)mem_read8(cpu, ea + 1u);
+                break;
+            case 5u:
+                v0 = (f64)mem_read16(cpu, ea);
+                if (!w) v1 = (f64)mem_read16(cpu, ea + 2u);
+                break;
+            case 6u:
+                v0 = (f64)(s8)mem_read8(cpu, ea);
+                if (!w) v1 = (f64)(s8)mem_read8(cpu, ea + 1u);
+                break;
+            default: /* 7 */
+                v0 = (f64)(s16)mem_read16(cpu, ea);
+                if (!w) v1 = (f64)(s16)mem_read16(cpu, ea + 2u);
+                break;
+            }
+            cpu->fpr[frD] = (f64)(f32)(v0 * mul);
+            cpu->ps1[frD] = w ? 1.0 : (f64)(f32)(v1 * mul);
+            return true;
+        }
     }
     return ppc_psq_load(cpu, frD, ea, w, gqr_index, indexed, cia);
 }
@@ -439,11 +495,47 @@ static inline bool ppc_psq_load_inline(CPUState* cpu, u8 frD, u32 ea, bool w,
 static inline bool ppc_psq_store_inline(CPUState* cpu, u8 frS, u32 ea, bool w,
                                         u8 gqr_index, bool indexed, u32 cia) {
     const u32 gqr = cpu->gqr[gqr_index & 7u];
-    if ((gqr & 7u) == 0u && (indexed || (cpu->hid2 & PPC_HID2_LSQE) != 0u)) {
-        mem_write32(cpu, ea, convert_to_single_ftz(f64_bits(cpu->fpr[frS])));
-        if (!w)
-            mem_write32(cpu, ea + 4u, convert_to_single_ftz(f64_bits(cpu->ps1[frS])));
-        return true;
+    const u32 type = gqr & 7u;
+    if (indexed || (cpu->hid2 & PPC_HID2_LSQE) != 0u) {
+        if (type == 0u) {
+            mem_write32(cpu, ea, convert_to_single_ftz(f64_bits(cpu->fpr[frS])));
+            if (!w)
+                mem_write32(cpu, ea + 4u, convert_to_single_ftz(f64_bits(cpu->ps1[frS])));
+            return true;
+        }
+        if (type >= 4u) {
+            const s32 n = ppc_psq_scale_field(gqr >> 8);
+            const f32 scale = f32_value((u32)(127 + n) << 23); /* 2^n */
+            switch (type) {
+            case 4u:
+                mem_write8(cpu, ea, (u8)ppc_psq_quantize_lane(cpu->fpr[frS], scale, 0, 255));
+                if (!w)
+                    mem_write8(cpu, ea + 1u,
+                               (u8)ppc_psq_quantize_lane(cpu->ps1[frS], scale, 0, 255));
+                break;
+            case 5u:
+                mem_write16(cpu, ea, (u16)ppc_psq_quantize_lane(cpu->fpr[frS], scale, 0, 65535));
+                if (!w)
+                    mem_write16(cpu, ea + 2u,
+                                (u16)ppc_psq_quantize_lane(cpu->ps1[frS], scale, 0, 65535));
+                break;
+            case 6u:
+                mem_write8(cpu, ea,
+                           (u8)(s8)ppc_psq_quantize_lane(cpu->fpr[frS], scale, -128, 127));
+                if (!w)
+                    mem_write8(cpu, ea + 1u,
+                               (u8)(s8)ppc_psq_quantize_lane(cpu->ps1[frS], scale, -128, 127));
+                break;
+            default: /* 7 */
+                mem_write16(cpu, ea,
+                            (u16)(s16)ppc_psq_quantize_lane(cpu->fpr[frS], scale, -32768, 32767));
+                if (!w)
+                    mem_write16(cpu, ea + 2u, (u16)(s16)ppc_psq_quantize_lane(
+                                                  cpu->ps1[frS], scale, -32768, 32767));
+                break;
+            }
+            return true;
+        }
     }
     return ppc_psq_store(cpu, frS, ea, w, gqr_index, indexed, cia);
 }
